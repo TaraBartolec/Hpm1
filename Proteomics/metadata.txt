@@ -1,5 +1,0 @@
-experiment	measure	sample	condition	replicate
-FWD_1	ratio	FWD_1	Hpm1_WT	1
-RV_1	ratio	RV_1	Hpm1_WT	1
-FWD_2	ratio	FWD_2	Hpm1_WT	2
-RV_2	ratio	RV_2	Hpm1_WT	2
