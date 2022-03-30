@@ -1,0 +1,411 @@
+---
+title: "Mapping of URPs onto an ensemble of PDB structures"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+library(tidyverse)
+library(curl)
+library(progress)
+```
+
+
+Generated from main analysis script
+```{r}
+CombinedURPs <- read.table("../MainAnalysis/URPsForMapping.txt", stringsAsFactors=FALSE, sep = "\t", header = TRUE)
+```
+
+Annotating information for individual crosslinked residues using the EBI resource SIFTS
+```{r}
+#downloaded from https://www.ebi.ac.uk/pdbe/docs/sifts/quick.html on 17/3/21
+UniprotSegments <- read.delim(file = "Data/SIFTS/uniprot_segments_observed.tsv", comment.char="#", stringsAsFactors = FALSE)
+
+#separating A/B residues (are different in interlinks)
+CombinedURPs <- CombinedURPs %>% 
+  separate(URP_Key, sep = "_", into = c("Res1", "Res2"), remove = FALSE) %>% 
+  separate(Res1, sep = "-", into = c("accessionA", "modposA"), remove = FALSE) %>% 
+  separate(Res2, sep = "-", into = c("accessionB", "modposB"), remove = FALSE)
+
+
+AllA <- CombinedURPs %>% 
+  select(Res1, accessionA, modposA) %>% 
+  rename(Accession = accessionA, modPos = modposA, Residue = Res1)%>% 
+  mutate(modPos = as.numeric(modPos))
+
+AllB <- CombinedURPs %>% 
+  select(Res2, accessionB, modposB) %>% 
+  rename(Accession = accessionB, modPos = modposB, Residue = Res2) %>% 
+  mutate(modPos = as.numeric(modPos))
+
+#merging A/B residues into single list
+All <- bind_rows(AllA, AllB) %>% 
+  mutate(Position = modPos + 1) %>% 
+  # adding +1 to position due to XLDB numbering being -1 compared to PDB - consistency to allow matching
+  select(Accession, Position, Residue) %>% 
+  distinct()
+remove(AllA, AllB)
+
+#merge residues with PDB info
+AllPDB <- left_join(All, UniprotSegments, by = c("Accession" = "SP_PRIMARY"))
+
+remove(All)
+ResolvedPDB <- AllPDB %>% 
+  filter((Position >= SP_BEG) &(Position <= SP_END)) %>% 
+  mutate(shift = as.numeric(PDB_BEG) - as.numeric(SP_BEG)) %>% 
+  mutate(ResInStructure = Position + shift)
+
+ResolvedPDBSuucinct <- ResolvedPDB %>% 
+  select(Residue, PDB, CHAIN, ResInStructure) %>% 
+  rename(PDB1 = PDB, CHAIN1 = CHAIN, ResInStructure1 = ResInStructure)
+
+CombinedURPs <- left_join(CombinedURPs, ResolvedPDBSuucinct, by = c("Res1" = "Residue"))
+
+ResolvedPDBSuucinct <- ResolvedPDBSuucinct %>% 
+   rename(PDB2 = PDB1, CHAIN2 = CHAIN1, ResInStructure2 = ResInStructure1)
+
+CombinedURPs <- left_join(CombinedURPs, ResolvedPDBSuucinct, by = c("Res2" = "Residue"))
+
+MappedURPs <- CombinedURPs %>% 
+  filter(PDB1 == PDB2) %>% 
+  distinct() %>% 
+  mutate(ID = row_number())
+
+PDBStructures <- ResolvedPDB %>% 
+  select(PDB) %>% 
+  distinct()
+
+```
+
+```{r}
+StructuresWithMappedXLs <- MappedURPs %>% 
+  select(PDB1) %>% 
+  distinct()
+```
+
+
+```{r}
+PDBStructureNumberMappings <- MappedURPs %>% 
+  group_by(PDB1) %>% 
+  summarise(NumMappings  = n())
+```
+
+```{r}
+UniprotSeqs <- read.delim(file = "../../Crosslinking/MainAnalysis/Data/UniProt/uniprot-filtered-reviewed_yes+AND+organism__Saccharomyces+cerevisiae+(st--.tab")
+```
+
+
+Generating a table of URPs for each PDB structure with crosslinks
+```{r}
+dir.create("Xwalk_Inputs")
+
+for(i in 1:NROW(StructuresWithMappedXLs)) {
+
+
+Structure <- StructuresWithMappedXLs$PDB[i]
+
+CrosslinksToMap <- MappedURPs %>% 
+  mutate(AminoAcid1 = "LYS") %>% 
+  mutate(AminoAcid2 = "LYS") %>% 
+  filter(PDB1 == Structure ) 
+
+CrosslinksToMapWithURP <- CrosslinksToMap %>% 
+  mutate(filename = paste0(Structure, ".pdb")) %>% 
+  mutate(LinkSite1 = paste0(AminoAcid1,"-", ResInStructure1,"-", CHAIN1, "-CA")) %>% 
+  mutate(LinkSite2 = paste0(AminoAcid2,"-", ResInStructure2,"-", CHAIN2, "-CA")) %>% 
+  select(URP_Key, filename,LinkSite1, LinkSite2) %>% 
+  distinct()
+
+RandomCrosslinksWithURP <- data.frame(matrix(NA, ncol=4, nrow=NROW(CrosslinksToMap)))
+colnames(RandomCrosslinksWithURP) <- c("URP_Key", "filename", "LinkSite1", "LinkSite2" )
+
+for(j in 1:NROW(CrosslinksToMap)) {
+
+    ResiduesK1 <- str_locate_all(UniprotSeqs$Sequence[UniprotSeqs$Entry ==  CrosslinksToMap$Accession1[j]], "K")[[1]][,1]
+
+  Random_K1 <-   sample(ResiduesK1)[1]
+  
+  ResiduesK2 <- str_locate_all(UniprotSeqs$Sequence[UniprotSeqs$Entry ==  CrosslinksToMap$Accession2[j]], "K")[[1]][,1]
+  Random_K2 <- sample(ResiduesK2)[1]
+  
+  if(Random_K1 == Random_K2) {
+      Random_K2 <- sample(ResiduesK2)[1]
+  }
+
+RandomCrosslinksWithURP$filename[j] <- CrosslinksToMapWithURP$filename[j]
+RandomCrosslinksWithURP$LinkSite1[j] <- paste0(CrosslinksToMap$AminoAcid1[j],"-",Random_K1 ,"-", CrosslinksToMap$CHAIN1[j], "-CA")
+RandomCrosslinksWithURP$LinkSite2[j] <- paste0(CrosslinksToMap$AminoAcid2[j],"-",Random_K2 ,"-", CrosslinksToMap$CHAIN2[j], "-CA")
+RandomCrosslinksWithURP$URP_Key[j] <- paste0(CrosslinksToMap$Accession1[j],"-",Random_K1 ,"_", CrosslinksToMap$Accession2[j], "-", Random_K2)
+
+}
+
+
+
+RandomCrosslinksToMap <- RandomCrosslinksWithURP %>% 
+    select(filename,LinkSite1, LinkSite2) 
+
+CrosslinksToMap <- CrosslinksToMapWithURP %>% 
+    select(filename,LinkSite1, LinkSite2) 
+
+write.table(RandomCrosslinksWithURP, file = paste0("Xwalk_Inputs/", Structure, "_Random_XLs_Xwalk-Input_withURPCode.txt"), sep = "\t", quote = FALSE, col.names = TRUE, row.names = FALSE)
+
+
+
+write.table(RandomCrosslinksToMap, file = paste0("Xwalk_Inputs/", Structure, "_Random_XLs_Xwalk-Input.txt"), sep = "\t", quote = FALSE, col.names = FALSE, row.names = TRUE)
+write.table(RandomCrosslinksWithURP, file = paste0("Xwalk_Inputs/", Structure, "_Random_XLs_Xwalk-Input_withURPCode.txt"), sep = "\t", quote = FALSE, col.names = TRUE, row.names = FALSE)
+
+write.table(CrosslinksToMap, file = paste0("Xwalk_Inputs/", Structure, "_XLs_Xwalk-Input.txt"), sep = "\t", quote = FALSE, col.names = FALSE, row.names = TRUE)
+write.table(CrosslinksToMapWithURP, file = paste0("Xwalk_Inputs/", Structure, "_XLs_Xwalk-Input_withURPCode.txt"), sep = "\t", quote = FALSE, col.names = TRUE, row.names = FALSE)
+
+print(i)
+}
+```
+
+
+```{r}
+
+PDBs <- unique(ResolvedPDB$PDB)
+
+for(i in 1:length(PDBs)) {
+  Structure =PDBs[i]
+
+  
+  PDB_Proteins_Chains <- ResolvedPDB %>% 
+  filter(PDB == Structure) %>% 
+  select(PDB, Accession, CHAIN) %>% 
+  distinct()
+
+AllPairTable <- data.frame(matrix(NA, ncol=0, nrow=0))
+
+for(j in 1:NROW(PDB_Proteins_Chains)) {
+
+  ResiduesK <- str_locate_all(UniprotSeqs$Sequence[UniprotSeqs$Entry ==  PDB_Proteins_Chains$Accession[j]], "K")[[1]][,1]
+  
+  AllLysines <- as.data.frame(ResiduesK)
+  AllLysines$Accession = PDB_Proteins_Chains$Accession[j]
+  AllLysines$Chain = PDB_Proteins_Chains$CHAIN[j]
+  AllLysines$Type = "AllPairs"
+  
+    Check <- AllPDB %>% 
+    filter(Accession == PDB_Proteins_Chains$Accession[j]) %>% 
+    filter(PDB == Structure) %>% 
+    select(Accession, CHAIN, PDB, RES_BEG:SP_END )
+  
+  AllLysines <- left_join(AllLysines, Check, by = c("Accession", "Chain" = "CHAIN"))
+  
+  
+  AllLysines <- AllLysines %>% 
+  mutate(shift = as.numeric(PDB_BEG) - as.numeric(SP_BEG)) %>% 
+  mutate(ResKInStructure = ResiduesK + shift)
+
+  FilteredLysines <- AllLysines %>%   
+    mutate(Resolved = if_else(((ResiduesK >= SP_BEG) &(ResiduesK <= SP_END)), TRUE, FALSE)) %>% 
+    group_by(PDB, Accession, Chain, ResiduesK, Type, ResKInStructure) %>% 
+    summarise(ResolvedAny = any(Resolved)) %>% 
+    filter(ResolvedAny == TRUE)
+    
+  AllPairTable <- bind_rows(AllPairTable, FilteredLysines)
+  }
+
+AllPairTable <- AllPairTable %>%
+  mutate(ResidueKey = paste0("LYS-", ResKInStructure, "-", Chain, "-CA")) %>% 
+  select(ResidueKey, Type)
+
+AllCombinations = full_join(AllPairTable, AllPairTable, by = "Type")
+
+AllCombinations <- AllCombinations %>%
+  mutate(filename = Structure) %>% 
+  mutate(URPKey = if_else(ResidueKey.x < ResidueKey.y, paste0(ResidueKey.x, "_", ResidueKey.y), paste0(ResidueKey.y, "_", ResidueKey.x))) %>% 
+  filter(ResidueKey.x != ResidueKey.y) %>% 
+  select(filename, URPKey) %>% 
+  distinct() %>% 
+  separate(URPKey, into = c("LinkSite1", "LinkSite2"), sep = "_")  
+  
+
+write.table(AllCombinations, file = paste0("Xwalk_Inputs/", Structure, "_AllPairs_Xwalk-Input.txt"), sep = "\t", quote = FALSE, col.names = FALSE, row.names = TRUE)
+
+command <- paste0("java -Xmx1024m -cp /Users/tarabartolec/Downloads/xwalk_v0.6/bin Xwalk -infile PDBs/", Structure, ".pdb -out Xwalk_Outputs/", Structure, "_AllPairs.xwalkoutput.tsv -dist Xwalk_Inputs/", Structure, "_AllPairs_Xwalk-Input.txt -max 50 -bb -f -euc" )
+
+system(command)
+
+print(i)
+}
+
+
+```
+
+
+Downloading the pdb files from the RCSB PDB website
+```{r eval=FALSE}
+
+dir.create("PDBs")
+
+NROW(StructuresWithMappedXLs)
+for (i in 1:NROW(StructuresWithMappedXLs)) {
+
+pdb = StructuresWithMappedXLs$PDB[i]
+url = paste0("https://files.rcsb.org/download/", pdb, ".pdb")
+name = paste0("PDBs/", pdb, ".pdb")
+
+req <- curl_fetch_disk(url, name)
+req$status_code
+
+if(!(req$status_code %in% c(200, 202))){
+    unlink(name)
+  print(paste("Number: " , i, " ", name, "removed"))
+} 
+}
+```
+
+Using xwalk to map URPs on and calculate euclidean distance
+```{r, eval=FALSE}
+dir.create("Xwalk_Outputs")
+
+
+for(i in 1:NROW(StructuresWithMappedXLs)) {
+
+pdb = StructuresWithMappedXLs$PDB[i]
+
+NumForPDB <- PDBStructureNumberMappings %>% 
+  filter(PDB1 == pdb)
+
+NumOfCrosslinkMappings = NumForPDB$NumMappings[1]
+
+if(NumOfCrosslinkMappings < 10000) {
+command <- paste0("java -Xmx1024m -cp /Users/tarabartolec/Downloads/xwalk_v0.6/bin Xwalk -infile PDBs/", pdb, ".pdb -out Xwalk_Outputs/", pdb, ".xwalkoutput.tsv -dist Xwalk_Inputs/", pdb, "_XLs_Xwalk-Input.txt -max 50 -bb -f -euc" )
+
+command2 <- paste0("java -Xmx1024m -cp /Users/tarabartolec/Downloads/xwalk_v0.6/bin Xwalk -infile PDBs/", pdb, ".pdb -out Xwalk_Outputs/", pdb, "_Random.xwalkoutput.tsv -dist Xwalk_Inputs/", pdb, "_Random_XLs_Xwalk-Input.txt -max 50 -bb -f -euc" )
+
+system(command)
+system(command2)
+
+print(i)
+}
+}
+```
+
+```{r, warning=FALSE, eval=FALSE}
+
+URPsMappedToStructure <- data.frame("", "", "", "", "", "", "")
+colnames(URPsMappedToStructure) <- c("Index", "filename", "LinkSite1", "LinkSite2", "DistAA", "CAEuclideanDistance", "URP_Key")
+
+for (i in 1:NROW(StructuresWithMappedXLs)) {
+
+pdb = StructuresWithMappedXLs$PDB[i]
+xwalkoutputname =  paste0("Xwalk_Outputs/", pdb, ".xwalkoutput.tsv") 
+xwalkinputURPname = paste0("Xwalk_Inputs/", pdb, "_XLs_Xwalk-Input_withURPCode.txt")
+
+xwalkoutput <- NA
+xwalkoutput <- try(read.delim(file = xwalkoutputname, stringsAsFactors = FALSE, header = FALSE))
+try({colnames(xwalkoutput) <- c("Index", "filename", "LinkSite1", "LinkSite2", "DistAA", "CAEuclideanDistance")})
+try({xwalkoutput <- xwalkoutput %>% 
+  select(1:6)})
+
+xwalkinputURP <- read.delim(file = xwalkinputURPname, stringsAsFactors = FALSE, header = TRUE)
+
+try(xwalkoutput <- left_join(xwalkoutput, xwalkinputURP))
+
+URPsMappedToStructure <- rbind(URPsMappedToStructure, xwalkoutput)
+
+print(i)
+}
+
+write.table(URPsMappedToStructure, file = "URPsMappedToStructure.txt", row.names = FALSE, quote = FALSE, sep = "\t")
+
+```
+
+
+#doing the same for the random subset
+```{r warning=FALSE, eval=FALSE}
+RandomURPsMappedToStructure <- data.frame("", "", "", "", "", "", "")
+colnames(RandomURPsMappedToStructure) <- c("Index", "filename", "LinkSite1", "LinkSite2", "DistAA", "CAEuclideanDistance", "URP_Key")
+
+for (i in 1:NROW(StructuresWithMappedXLs)) {
+
+pdb = StructuresWithMappedXLs$PDB[i]
+xwalkoutputname =  paste0("Xwalk_Outputs/", pdb, "_Random.xwalkoutput.tsv") 
+xwalkinputURPname = paste0("Xwalk_Inputs/", pdb, "_Random_XLs_Xwalk-Input_withURPCode.txt")
+
+xwalkoutput <- NA
+xwalkoutput <- try(read.delim(file = xwalkoutputname, stringsAsFactors = FALSE, header = FALSE))
+try({colnames(xwalkoutput) <- c("Index", "filename", "LinkSite1", "LinkSite2", "DistAA", "CAEuclideanDistance")})
+try({xwalkoutput <- xwalkoutput %>% 
+  select(1:6)})
+
+xwalkinputURP <- read.delim(file = xwalkinputURPname, stringsAsFactors = FALSE, header = TRUE)
+
+try(xwalkoutput <- left_join(xwalkoutput, xwalkinputURP))
+
+RandomURPsMappedToStructure <- rbind(RandomURPsMappedToStructure, xwalkoutput)
+}
+
+write.table(RandomURPsMappedToStructure, file = "RandomURPsMappedToStructure.txt", row.names = FALSE, quote = FALSE, sep = "\t")
+```
+
+
+Summarising distances across structures by taking the minimum distance imposed for a URP on any structure
+```{r}
+#A pre-compiled file to save time on reanalysis
+URPsMappedToStructure <-  read.delim("URPsMappedToStructure.txt")
+RandomURPsMappedToStructure <-  read.delim("RandomURPsMappedToStructure.txt")
+
+URPsMappedToStructure$Category = "Crosslinks"
+
+RandomURPsMappedToStructure$Category = "Random"
+
+URPsMappedToStructure <- bind_rows(URPsMappedToStructure, RandomURPsMappedToStructure)
+
+
+URPsMappedToStructureSummary <- URPsMappedToStructure %>% 
+  filter(!(str_detect(Index, "Error")))  %>% 
+  mutate(CAEuclideanDistance = as.numeric(CAEuclideanDistance)) %>% 
+  group_by(URP_Key, Category) %>% 
+  summarise(minDist = min(CAEuclideanDistance), maxDist = max(CAEuclideanDistance), numMappings = n(), numStructures = n_distinct(filename))  %>% 
+  mutate(RangeOfDistance = maxDist - minDist) %>% 
+  filter(!is.na(RangeOfDistance))
+
+
+StructureSummary <- URPsMappedToStructure %>% 
+   filter(!(str_detect(Index, "Error"))) %>% 
+  group_by(filename, URP_Key) %>% 
+  summarise(MinDist = min(CAEuclideanDistance)) %>% 
+  mutate(Valid = MinDist <= 42)
+
+StructureSummary2 <- StructureSummary %>% 
+  filter(filename != "") %>% 
+  group_by(filename) %>% 
+  summarise(NumURPs = n_distinct(URP_Key), NumValid = sum(Valid)) %>% 
+  mutate(PercentValid = 100*(NumValid/NumURPs) )
+
+
+NROW(unique(URPsMappedToStructure$filename))
+NROW(unique(URPsMappedToStructureSummary$URP_Key))
+
+write_tsv(URPsMappedToStructure, file = "URPsMappedToStructure.txt" )
+
+
+ggplot(URPsMappedToStructureSummary, aes(x = minDist, fill = Category)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = 42) +
+   scale_fill_manual(values = c("blue", "#bababa") )+
+  #ggtitle(paste0( NROW(URPsMappedToStructureSummary), " URPs mapped across ",  NROW(unique(URPsMappedToStructure$filename)) ," pdb structures")) +
+  xlab("Min. Ca-Ca euclidean distance of URP\nin any PDB file and subunit configuration") +
+    theme_bw() +
+   theme(legend.position = "none", 
+          text=element_text(size=10,  family="Arial"), 
+          panel.border = element_rect(fill=NA, colour = "black", size=1),
+          panel.grid.minor = element_blank())
+
+
+ggsave(filename = "URPsOnStructure.pdf", device = cairo_pdf, 
+       width = 2.5, height = 1.65, units = "in")
+```
+
+
+
+
+
+
